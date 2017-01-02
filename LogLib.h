@@ -63,6 +63,7 @@ extern void LogATT_nosd();
 extern void BTSend();
 extern Adafruit_BLE_UART BTLEserial;
 extern String GetUTCTime (unsigned int gps_week, unsigned long gps_tow);
+extern String GetDeltaTime(float time);
 
 String null_add(int value);
 void dataFloat(float value, int mode);
@@ -82,6 +83,7 @@ extern int filesize;
 extern int checksums;
 extern BMsg838 gps;
 extern String UTC_Time;
+extern String Delta_Time;
 extern float course_angle; 
 
 struct CAN_DATA{

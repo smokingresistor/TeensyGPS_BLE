@@ -20,6 +20,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
 #include "Adafruit_BLE_UART.h"
+#include "NXPMotionSense.h"
 
 Adafruit_BMP280 bme; // I2C
 
@@ -65,7 +66,7 @@ KalmanFilterVA filterVA;
 /*variables for conversion from float to 4 uint8_t*/
 union conv lat, lon, lat_fil, lon_fil;
 /*variables for conversion from int16_t to 2 uint8_t*/
-union conv_short alt, alt_fil, dof_yaw, dof_roll, dof_pitch, acc_x, acc_y, acc_z, q1, q2, q3, q4, gyr_x, gyr_y, gyr_z;
+union conv_short alt, alt_fil, dof_yaw, dof_roll, dof_pitch, acc_x, acc_y, acc_z, q1, q2, q3, q4, gyr_x, gyr_y, gyr_z, r_o;
 /*variables for conversion from uint16_t to 2 uint8_t*/
 union conv_short_u pressure, vel, vel_fil, course, lap_dist, stint_time, g_dop, p_dop, h_dop, v_dop, t_dop ;
 
@@ -79,8 +80,9 @@ uint8_t sats,fix;
 
 boolean log_en;
 int newlog, rate, can_speed, max_filesize, filesize, log_type, trig, intv;
-float blat, blong, btime, btol, course_angle, trigv, min_val, max_val, stint_duration;
+float blat, blong, btime, btol, course_angle,course_angle2, trigv, min_val, max_val, stint_duration;
 String UTC_Time;
+String Delta_Time;
 
 /*structures for config data*/
 struct DOF_DATA att;
@@ -89,14 +91,18 @@ struct FLS_DATA FLS[3];
 struct PIT_DATA PIT[1];
 
 /*variables for 9dof data*/
-float ax, ay, az, gx, gy, gz, mx, my, mz; // variables to hold latest sensor data values 
+float ax, ay, az, gx, gy, gz, mx, my, mz, x, y, z; // variables to hold latest sensor data values 
 float heading, roll, pitch, yaw, temp, inclination, lap_distance; 
-float yaw_rate;
+float yaw_rate, prev_yaw;
 float bmp280_pressure;
 float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};    // vector to hold quaternion
 pt prev_gps;  //curr_gps removed, structs of points defined in loglib.h
+pt prev_gps_2;
 float Timer_50Hz = 20; //20ms
 float prev_time;
+/////////////////////////////////////
+// Trajectory Radius Variables
+float x_0,y_0,x_1,y_1,x_2,y_2,ro,delta_course=0;
 /////////////////////////////////////
 // trigger line virables
 boolean beacon_output=1;
@@ -116,9 +122,14 @@ int pin_beacon[3] = {26, 27, 28}; //26 27 28 for New board 33 32 31 for Bt board
 
 //////////////////////////////////////
 // buffers fo gps coordinates 
-const int bearing_buffer=10;
+const int bearing_buffer=25;
+const int bearing_buffer_2=50;
 SimpleFIFO<float,bearing_buffer> Lat_buffer;
 SimpleFIFO<float,bearing_buffer> Long_buffer;
+//added a second FIFO buffer to output corner radius from a circonference passing from 3 points
+SimpleFIFO<float,bearing_buffer_2> Lat_buffer_2;
+SimpleFIFO<float,bearing_buffer_2> Long_buffer_2;
+
 //////////////////////////////////////
 /**************************************************************************/
 /*!
@@ -138,6 +149,13 @@ void setup()
     Lat_buffer.enqueue(0.0);
     Long_buffer.enqueue(0.0);
   }
+
+    for (int i=0; i < bearing_buffer_2; i++)
+  {
+    Lat_buffer_2.enqueue(0.0);
+    Long_buffer_2.enqueue(0.0);
+  }
+  
   // Serial start with 115200 baudrate
   Serial.begin(115200); 
   //delay(30000);
@@ -293,24 +311,110 @@ void setup()
 // main loop
 void loop()
 {
+  int ret=0;
+  char messagetype[64];
+  memset(messagetype,0,64);
   // Open file for logging
   dataFile = SD.open(namefile, FILE_WRITE);
   while (1)
   {
       float now_time = millis();
       // read 9 dof data and BMP280 with 50Hz cycle
-      if (now_time - prev_time > Timer_50Hz){
-//          Serial.println(now_time);
+      if (now_time - prev_time >= Timer_50Hz){
+          //Serial.println("Start loop");
+          //Serial.println(now_time);
+          prev_time = now_time;
           sensor_9dof_read();
           bmp280_pressure = bme.readPressure()/100.0; //pressure in mBar
-          prev_time = now_time;
+          //Serial.print("UTC time: ");
+          // Get UTC Time
+          UTC_Time = GetUTCTime(gps.venus838data_raw.gps_week, gps.venus838data_raw.timeofweek);
+          //Serial.println(UTC_Time);
+          // Get Delta Time
+          float time = millis();
+          Delta_Time = GetDeltaTime(time);
+          //Serial.println(Delta_Time);
+          // Put last gps coordinates to buffer
+          Lat_buffer.enqueue(gps.venus838data_raw.Latitude);
+          Long_buffer.enqueue(gps.venus838data_raw.Longitude); 
+          Lat_buffer_2.enqueue(gps.venus838data_raw.Latitude);
+          Long_buffer_2.enqueue(gps.venus838data_raw.Longitude);       
+          // Take first gps coordinates from buffer
+          prev_gps.lat=Lat_buffer.dequeue();
+          prev_gps.lon=Long_buffer.dequeue();     
+          prev_gps_2.lat=Lat_buffer_2.dequeue();
+          prev_gps_2.lon=Long_buffer_2.dequeue(); 
+          // Calc course angle    
+          course_angle = gps.course_to(gps.venus838data_raw.Latitude, gps.venus838data_raw.Longitude, prev_gps.lat, prev_gps.lon);   
+          course_angle2 = gps.course_to(gps.venus838data_raw.Latitude, gps.venus838data_raw.Longitude, prev_gps_2.lat, prev_gps_2.lon); 
+           
+           //calculate trayctory radius
+          x_0=0;
+          y_0=0;
+          x_2=6372795*sin(radians(prev_gps_2.lon-gps.venus838data_raw.Longitude));
+          y_2=6372795*sin(radians(prev_gps_2.lat-gps.venus838data_raw.Latitude));
+          x_1=6372795*sin(radians(prev_gps.lon-gps.venus838data_raw.Longitude));
+          y_1=6372795*sin(radians(prev_gps.lat-gps.venus838data_raw.Latitude));  
+
+          ro=calculate_trajecotry_curvature(x_0,y_0,x_1,y_1,x_2,y_2);
+  
+          delta_course=course_angle2-course_angle;
+
+          if ((delta_course<=0)||(delta_course>=300)) ro=-ro;
+           
+          //Calculate lap distance
+          t1=millis();    
+          dt=t1-t0;
+          t0=t1;                
+          laptime = laptime + dt;  //laptime in milliseconds
+          
+          temp=dt;
+          temp=temp/1000;  //dt in seconds
+          
+          lap_distance=lap_distance+temp*gps.venus838data_raw.velocity;  //Lap distance in meters   
+          temp=temp/60;
+          stint_duration = stint_duration + temp;  //stint duration in minutes
+      
+          if (beacon_output)
+              check_beacon_dist(); 
+          
+          if (can_speed)
+          {
+              if (!log_output) LogATT_nosd();
+              can_send();
+          }    
+          if (log_output){
+              if((newlog==0)&&(filesize > (max_filesize*1048576))){ //file size more than max 
+                  Serial.println("File's size exceeds max size"); 
+                  dataFile.flush();
+                  dataFile.close(); 
+                  Serial.println("Create new log");
+                  create_newlog();
+              }//if
+              log_en = false; //disable before check
+              if (log_type==0) // continuous log
+                  log_en = true;
+              if (log_type==1) //trigger log
+                  log_en = check_triggers();
+              if (log_type==2) //interval log
+                  log_en = check_intervals();
+              if (log_en){
+                  if (led_blink.check())
+                    {
+                     led_on=!led_on;
+                     digitalWrite(led,led_on);
+                     led_blink.reset();
+                    }
+                  //Serial.print("Time start log: ");
+                  //Serial.println(millis());
+                  LogTPV(); // log TPV object
+                  LogATT(); // log ATT object 
+                  //Serial.print("Time stop log: ");
+                  //Serial.println(millis());
+              }//if      
+          }
       }
-      int ret=0;
-      char messagetype[64];
-      memset(messagetype,0,64);
       if(Serial2.available()){
-//           Serial.println("Start loop");
-//           Serial.println(millis());
            // read number of returned bytes
            ret=waitingRespondandReceive(gps.RecVBinarybuf,0xA8,2000); 
            if(ret>7){        
@@ -346,70 +450,7 @@ void loop()
                 Serial.println(";");
                 */
     
-    //Serial.print("UTC time: ");
-    // Get UTC Time
-    UTC_Time = GetUTCTime(gps.venus838data_raw.gps_week, gps.venus838data_raw.timeofweek);
-    //Serial.println(UTC_Time);
-    // Put last gps coordinates to buffer
-    Lat_buffer.enqueue(gps.venus838data_raw.Latitude);
-    Long_buffer.enqueue(gps.venus838data_raw.Longitude);     
-    // Take first gps coordinates from buffer
-    prev_gps.lat=Lat_buffer.dequeue();
-    prev_gps.lon=Long_buffer.dequeue();     
-    // Calc course angle    
-    course_angle = gps.course_to(gps.venus838data_raw.Latitude, gps.venus838data_raw.Longitude, prev_gps.lat, prev_gps.lon);   
-    //Calculate lap distance
-    
-    t1=millis();    
-    dt=t1-t0;
-    t0=t1;                
-    laptime = laptime + dt;  //laptime in milliseconds
-    
-    temp=dt;
-    temp=temp/1000;  //dt in seconds
-    
-    lap_distance=lap_distance+temp*gps.venus838data_raw.velocity;  //Lap distance in meters   
-    temp=temp/60;
-    stint_duration = stint_duration + temp;  //stint duration in minutes
-
-    if (beacon_output)
-        check_beacon_dist(); 
-    
-    if (can_speed)
-    {
-        if (!log_output) LogATT_nosd();
-        can_send();
-    }    
     BTSend();
-    if (log_output){
-        if((newlog==0)&&(filesize > (max_filesize*1048576))){ //file size more than max 
-            Serial.println("File's size exceeds max size"); 
-            dataFile.flush();
-            dataFile.close(); 
-            Serial.println("Create new log");
-            create_newlog();
-        }//if
-        log_en = false; //disable before check
-        if (log_type==0) // continuous log
-            log_en = true;
-        if (log_type==1) //trigger log
-            log_en = check_triggers();
-        if (log_type==2) //interval log
-            log_en = check_intervals();
-        if (log_en){
-            if (led_blink.check())
-              {
-               led_on=!led_on;
-               digitalWrite(led,led_on);
-               led_blink.reset();
-              }
-//            Serial.print("Time start log: ");
-//            Serial.println(millis());
-            LogTPV(); // log TPV object
-            LogATT(); // log ATT object 
-//            Serial.print("Time stop log: "); 
-//            Serial.println(millis());
-        }//if      
 //                Serial.println("filtered data:\n");                
 //                printpositionfloatformat(gps.venus838data_filter.Latitude, 10000000, "  Latitude= ", "degree");
 //                printpositionfloatformat(gps.venus838data_filter.Longitude, 10000000, "  Longitude= ", "degree");
@@ -435,8 +476,7 @@ void loop()
 //                printpositionfloatformat(gps.venus838data_raw.VDOP, 100, "  VDOP= ", "");
 //                printpositionfloatformat(gps.venus838data_raw.TDOP, 100, "  TDOP= ", "");
       
-      
-         }//if
+    
        }//if ret
     }//if serial     
   }//while
@@ -444,12 +484,11 @@ void loop()
 
 
 void check_beacon_dist(){
-   float distance;
    boolean crossing_true;
    // pt curr_gps, prev_gps; //moved to global
    //curr_gps.lat = gps.venus838data_filter.Latitude;
    //curr_gps.lon = gps.venus838data_filter.Longitude;
-   for (int i = 0; i < (sizeof(beacons))/(sizeof(beacons[0])); i++){
+   for (unsigned int i = 0; i < (sizeof(beacons))/(sizeof(beacons[0])); i++){
      if (FLS[i].en)
       {
        crossing_true = get_line_intersection (beacons[i].p0_lat, beacons[i].p0_lon, beacons[i].p1_lat, beacons[i].p1_lon, prev_gps.lat, prev_gps.lon, gps.venus838data_raw.Latitude, gps.venus838data_raw.Longitude);
@@ -610,10 +649,33 @@ boolean get_line_intersection(float p0_x, float p0_y, float p1_x, float p1_y,flo
     return true;
 }
 
+// fn calculate_trajecotry_curvature
+
+float calculate_trajecotry_curvature(float _x1, float _y1, float _x2, float _y2, float _x3, float _y3){
+   float a,b,c,s,area,radius,_ro;
+   
+        a = sqrt(pow((_x1-_x2),2)+pow((_y1-_y2),2));
+        b = sqrt(pow((_x2-_x3),2)+pow((_y2-_y3),2));
+        c = sqrt(pow((_x3-_x1),2)+pow((_y3-_y1),2));
+        s = (a+b+c)/2;
+        area = sqrt(s*(s-a)*(s-b)*(s-c)); 
+        //Serial.print("Area ");
+        //Serial.println(area,20);
+        if (area==0) {
+         _ro=0;         
+        }
+        else {
+         radius = (a*b*c)/(4*area);
+        //Serial.print("Radius ");
+        //Serial.println(radius,20);
+          _ro=1/radius;
+        }
+        return _ro;
+}
+
 //fn can_send
 
 void can_send(){
-  static float prev_roll, prev_pitch;
   if (led_blink.check())
   {
      led_on=!led_on;
@@ -646,6 +708,8 @@ void can_send(){
   dof_pitch.f = (int16_t)(att.pitch*100);
   dof_yaw.f = (int16_t)(att.yaw*100);
   pressure.f = (uint16_t)(bmp280_pressure*10);
+
+  r_o.f=(int16_t)((ro)*100000);
   
   acc_x.f = (int16_t)(att.acc_x*100);
   acc_y.f = (int16_t)(att.acc_y*100);
@@ -691,9 +755,14 @@ void can_send(){
   can_nav.buf[5]=course.b[0];
   can_nav.buf[6]=checksums;
   can_nav.buf[7]=fix|sats; 
+  
   //4 frame
-  can_nav_fil.buf[0]=alt_fil.b[1];
-  can_nav_fil.buf[1]=alt_fil.b[0];
+  
+  // can_nav_fil.buf[0]=alt_fil.b[1];
+  //can_nav_fil.buf[1]=alt_fil.b[0];
+
+  can_nav_fil.buf[0]=r_o.b[1];
+  can_nav_fil.buf[1]=r_o.b[0];
   can_nav_fil.buf[2]=vel_fil.b[1];
   can_nav_fil.buf[3]=vel_fil.b[0];
   can_nav_fil.buf[4]=stint_time.b[1]; //changed to stint time
